@@ -5,9 +5,7 @@ import requests
 import time
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
-import talib
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -18,6 +16,40 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ---------- Indicator helpers (pure NumPy/Pandas) ----------
+def sma(series: pd.Series, period: int):
+    return series.rolling(window=period, min_periods=period).mean()
+
+def ema(series: pd.Series, period: int):
+    return series.ewm(span=period, adjust=False, min_periods=period).mean()
+
+def rsi(series: pd.Series, period: int = 14):
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    gain = pd.Series(gain, index=series.index)
+    loss = pd.Series(loss, index=series.index)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val.fillna(50)
+
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    fast_ema = ema(series, fast)
+    slow_ema = ema(series, slow)
+    macd_line = fast_ema - slow_ema
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def bbands(series: pd.Series, period=20, std_dev=2):
+    mid = sma(series, period)
+    rolling_std = series.rolling(window=period, min_periods=period).std()
+    upper = mid + std_dev * rolling_std
+    lower = mid - std_dev * rolling_std
+    return upper, mid, lower
 
 # Custom CSS for dark mode
 def load_css():
@@ -36,78 +68,54 @@ def load_css():
         border: 1px solid var(--border-color);
         margin: 0.5rem 0;
     }
-    .profit-positive {
-        color: #00ff88;
-        font-weight: bold;
-    }
-    .profit-negative {
-        color: #ff4444;
-        font-weight: bold;
-    }
+    .profit-positive { color: #00ff88; font-weight: bold; }
+    .profit-negative { color: #ff4444; font-weight: bold; }
     .bot-recommendation {
-        padding: 1rem;
-        border-radius: 8px;
-        margin: 0.5rem 0;
-        border-left: 4px solid;
+        padding: 1rem; border-radius: 8px; margin: 0.5rem 0; border-left: 4px solid;
     }
-    .long-bot {
-        border-left-color: #00ff88;
-        background-color: rgba(0, 255, 136, 0.1);
-    }
-    .short-bot {
-        border-left-color: #ff4444;
-        background-color: rgba(255, 68, 68, 0.1);
-    }
-    .range-bot {
-        border-left-color: #ffaa00;
-        background-color: rgba(255, 170, 0, 0.1);
-    }
+    .long-bot { border-left-color: #00ff88; background-color: rgba(0, 255, 136, 0.1); }
+    .short-bot { border-left-color: #ff4444; background-color: rgba(255, 68, 68, 0.1); }
+    .range-bot { border-left-color: #ffaa00; background-color: rgba(255, 170, 0, 0.1); }
     </style>
     """, unsafe_allow_html=True)
 
 class BinanceScanner:
     def __init__(self):
-        self.base_url = "https://api.binance.com"
+        # Use Futures API base
+        self.base_url = "https://fapi.binance.com"
         self.session = requests.Session()
 
     def get_top_futures_symbols(self, limit=30):
-        """Get top futures symbols by 24h volume"""
         try:
             url = f"{self.base_url}/fapi/v1/ticker/24hr"
-            response = self.session.get(url, timeout=10)
+            response = self.session.get(url, timeout=15)
+            response.raise_for_status()
             data = response.json()
-
-            # Filter USDT pairs and sort by volume
-            usdt_pairs = [item for item in data if item['symbol'].endswith('USDT')]
-            sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)
-
+            usdt_pairs = [item for item in data if item.get('symbol','').endswith('USDT')]
+            sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x.get('quoteVolume', 0) or 0), reverse=True)
             return sorted_pairs[:limit]
         except Exception as e:
             st.error(f"Error fetching symbols: {e}")
             return []
 
     def get_klines(self, symbol, interval, limit=100):
-        """Get kline data for a symbol"""
         try:
             url = f"{self.base_url}/fapi/v1/klines"
-            params = {
-                'symbol': symbol,
-                'interval': interval,
-                'limit': limit
-            }
-            response = self.session.get(url, params=params, timeout=10)
+            params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+            response = self.session.get(url, params=params, timeout=15)
+            response.raise_for_status()
             data = response.json()
-
+            if not isinstance(data, list):
+                return pd.DataFrame()
             df = pd.DataFrame(data, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                 'close_time', 'quote_volume', 'trades', 'taker_buy_base',
                 'taker_buy_quote', 'ignore'
             ])
-
             for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = pd.to_numeric(df[col])
-
+                df[col] = pd.to_numeric(df[col], errors='coerce')
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = df.dropna().reset_index(drop=True)
             return df
         except Exception as e:
             st.error(f"Error fetching klines for {symbol}: {e}")
@@ -116,38 +124,35 @@ class BinanceScanner:
 class TechnicalAnalyzer:
     @staticmethod
     def two_pole_oscillator(df, length=20):
-        """Implementation of the Two-Pole Oscillator from Pine Script"""
-        close = df['close'].values
-        high = df['high'].values
-        low = df['low'].values
-
-        # Calculate SMA and normalized values
-        sma1 = talib.SMA(close, 25)
+        if df.empty or len(df) < 30:
+            n = len(df)
+            arr = np.zeros(n)
+            return {
+                'oscillator': arr, 'oscillator_prev': np.roll(arr, 4),
+                'buy_signals': [], 'sell_signals': [], 'current_value': 0.0
+            }
+        close = df['close']
+        sma1 = sma(close, 25)
         close_sma_diff = close - sma1
-        sma_diff = talib.SMA(close_sma_diff, 25)
-        std_diff = talib.STDDEV(close_sma_diff, 25)
-        sma_n1 = (close_sma_diff - sma_diff) / std_diff
+        sma_diff = sma(close_sma_diff, 25)
+        std_diff = close_sma_diff.rolling(25, min_periods=25).std()
+        sma_n1 = (close_sma_diff - sma_diff) / std_diff.replace(0, np.nan)
+        sma_n1 = sma_n1.fillna(0.0).values
 
-        # Two-pole filter implementation
         alpha = 2.0 / (length + 1)
         smooth1 = np.zeros_like(sma_n1)
         smooth2 = np.zeros_like(sma_n1)
-
         for i in range(len(sma_n1)):
             if i == 0:
-                smooth1[i] = sma_n1[i] if not np.isnan(sma_n1[i]) else 0
+                smooth1[i] = sma_n1[i]
                 smooth2[i] = smooth1[i]
             else:
-                smooth1[i] = (1 - alpha) * smooth1[i-1] + alpha * sma_n1[i] if not np.isnan(sma_n1[i]) else smooth1[i-1]
+                smooth1[i] = (1 - alpha) * smooth1[i-1] + alpha * sma_n1[i]
                 smooth2[i] = (1 - alpha) * smooth2[i-1] + alpha * smooth1[i]
-
         two_p = smooth2
-        two_pp = np.roll(two_p, 4)  # two_p[4] in Pine Script
+        two_pp = np.roll(two_p, 4)
 
-        # Generate signals
-        buy_signals = []
-        sell_signals = []
-
+        buy_signals, sell_signals = [], []
         for i in range(1, len(two_p)):
             if two_p[i] > two_pp[i] and two_p[i-1] <= two_pp[i-1] and two_p[i] < 0:
                 buy_signals.append(i)
@@ -159,67 +164,46 @@ class TechnicalAnalyzer:
             'oscillator_prev': two_pp,
             'buy_signals': buy_signals,
             'sell_signals': sell_signals,
-            'current_value': two_p[-1] if len(two_p) > 0 else 0
+            'current_value': float(two_p[-1]) if len(two_p) else 0.0
         }
 
     @staticmethod
     def calculate_support_resistance(df, window=20):
-        """Calculate support and resistance levels"""
-        highs = df['high'].rolling(window=window).max()
-        lows = df['low'].rolling(window=window).min()
-
-        resistance = highs.iloc[-1]
-        support = lows.iloc[-1]
-
-        return support, resistance
+        if df.empty or len(df) < window:
+            return np.nan, np.nan
+        highs = df['high'].rolling(window=window, min_periods=window).max()
+        lows = df['low'].rolling(window=window, min_periods=window).min()
+        return float(lows.iloc[-1]), float(highs.iloc[-1])
 
     @staticmethod
     def calculate_rsi(df, period=14):
-        """Calculate RSI"""
-        return talib.RSI(df['close'].values, timeperiod=period)
+        return rsi(df['close'], period)
 
     @staticmethod
     def calculate_macd(df):
-        """Calculate MACD"""
-        macd, signal, histogram = talib.MACD(df['close'].values)
-        return macd, signal, histogram
+        return macd(df['close'])
 
     @staticmethod
     def calculate_bollinger_bands(df, period=20, std=2):
-        """Calculate Bollinger Bands"""
-        upper, middle, lower = talib.BBANDS(df['close'].values, timeperiod=period, nbdevup=std, nbdevdn=std)
-        return upper, middle, lower
+        return bbands(df['close'], period, std)
 
 class TradingBotAnalyzer:
     @staticmethod
     def analyze_trend_direction(df_1h, df_15m, df_5m, df_1m):
-        """Analyze trend direction across multiple timeframes"""
-        timeframes = {
-            '1h': df_1h,
-            '15m': df_15m,
-            '5m': df_5m,
-            '1m': df_1m
-        }
-
+        timeframes = {'1h': df_1h, '15m': df_15m, '5m': df_5m, '1m': df_1m}
         predictions = {}
-
         for tf, df in timeframes.items():
-            if df.empty:
+            if df.empty or len(df) < 12:
                 predictions[tf] = 'Unknown'
                 continue
+            rsi_vals = TechnicalAnalyzer.calculate_rsi(df)
+            macd_line, signal_line, _ = TechnicalAnalyzer.calculate_macd(df)
+            tp = TechnicalAnalyzer.two_pole_oscillator(df)
 
-            # Calculate indicators
-            rsi = TechnicalAnalyzer.calculate_rsi(df)
-            macd, signal, _ = TechnicalAnalyzer.calculate_macd(df)
-            two_pole = TechnicalAnalyzer.two_pole_oscillator(df)
-
-            # Trend analysis
             price_trend = 1 if df['close'].iloc[-1] > df['close'].iloc[-10] else -1
-            rsi_trend = 1 if rsi[-1] > 50 else -1
-            macd_trend = 1 if macd[-1] > signal[-1] else -1
-            oscillator_trend = 1 if two_pole['current_value'] > 0 else -1
-
-            # Combine signals
+            rsi_trend = 1 if rsi_vals.iloc[-1] > 50 else -1
+            macd_trend = 1 if macd_line.iloc[-1] > signal_line.iloc[-1] else -1
+            oscillator_trend = 1 if tp['current_value'] > 0 else -1
             total_score = price_trend + rsi_trend + macd_trend + oscillator_trend
 
             if total_score >= 2:
@@ -228,40 +212,32 @@ class TradingBotAnalyzer:
                 predictions[tf] = 'Downward'
             else:
                 predictions[tf] = 'Ranging'
-
         return predictions
 
     @staticmethod
     def recommend_bot_strategy(df, symbol, current_price):
-        """Recommend bot strategy based on technical analysis"""
         if df.empty:
             return None
-
-        # Calculate indicators
-        rsi = TechnicalAnalyzer.calculate_rsi(df)
+        rsi_vals = TechnicalAnalyzer.calculate_rsi(df)
         upper_bb, middle_bb, lower_bb = TechnicalAnalyzer.calculate_bollinger_bands(df)
         support, resistance = TechnicalAnalyzer.calculate_support_resistance(df)
         two_pole = TechnicalAnalyzer.two_pole_oscillator(df)
 
-        # Get latest values
-        current_rsi = rsi[-1] if not np.isnan(rsi[-1]) else 50
-        current_upper_bb = upper_bb[-1] if not np.isnan(upper_bb[-1]) else current_price * 1.02
-        current_lower_bb = lower_bb[-1] if not np.isnan(lower_bb[-1]) else current_price * 0.98
+        current_rsi = float(rsi_vals.iloc[-1]) if not pd.isna(rsi_vals.iloc[-1]) else 50
+        mid = float(middle_bb.iloc[-1]) if not pd.isna(middle_bb.iloc[-1]) else current_price
+        current_upper_bb = float(upper_bb.iloc[-1]) if not pd.isna(upper_bb.iloc[-1]) else current_price * 1.02
+        current_lower_bb = float(lower_bb.iloc[-1]) if not pd.isna(lower_bb.iloc[-1]) else current_price * 0.98
         oscillator_value = two_pole['current_value']
 
-        # Bot recommendations
-        recommendations = []
+        recs = []
 
-        # Long Bot Analysis
-        if (current_rsi < 40 and oscillator_value < -0.3 and 
-            current_price < middle_bb[-1] and len(two_pole['buy_signals']) > 0):
-
+        if (current_rsi < 40 and oscillator_value < -0.3 and
+            current_price < mid and len(two_pole['buy_signals']) > 0):
             entry_price = current_price
-            upper_range = min(resistance, current_upper_bb)
-            stop_loss = max(support, current_price * 0.97)
+            upper_range = min(resistance if not pd.isna(resistance) else current_upper_bb, current_upper_bb)
+            stop_loss = max(support if not pd.isna(support) else current_price * 0.97, current_price * 0.97)
             expected_profit = ((upper_range - entry_price) / entry_price) * 100
-
-            recommendations.append({
+            recs.append({
                 'type': 'LONG',
                 'confidence': min(90, max(60, 100 - current_rsi + abs(oscillator_value) * 20)),
                 'entry_range': f"{entry_price:.4f}",
@@ -271,16 +247,13 @@ class TradingBotAnalyzer:
                 'expected_profit': f"{expected_profit:.2f}%"
             })
 
-        # Short Bot Analysis
-        if (current_rsi > 60 and oscillator_value > 0.3 and 
-            current_price > middle_bb[-1] and len(two_pole['sell_signals']) > 0):
-
+        if (current_rsi > 60 and oscillator_value > 0.3 and
+            current_price > mid and len(two_pole['sell_signals']) > 0):
             entry_price = current_price
-            lower_range = max(support, current_lower_bb)
-            stop_loss = min(resistance, current_price * 1.03)
+            lower_range = max(support if not pd.isna(support) else current_lower_bb, current_lower_bb)
+            stop_loss = min(resistance if not pd.isna(resistance) else current_price * 1.03, current_price * 1.03)
             expected_profit = ((entry_price - lower_range) / entry_price) * 100
-
-            recommendations.append({
+            recs.append({
                 'type': 'SHORT',
                 'confidence': min(90, max(60, current_rsi - 10 + abs(oscillator_value) * 20)),
                 'entry_range': f"{entry_price:.4f}",
@@ -290,25 +263,22 @@ class TradingBotAnalyzer:
                 'expected_profit': f"{expected_profit:.2f}%"
             })
 
-        # Range Bot Analysis
-        range_size = (resistance - support) / current_price
-        if (range_size > 0.02 and range_size < 0.08 and 
-            abs(oscillator_value) < 0.5 and 30 < current_rsi < 70):
-
-            recommendations.append({
+        range_size = 0.0
+        if not pd.isna(resistance) and not pd.isna(support) and current_price > 0:
+            range_size = (resistance - support) / current_price
+        if (0.02 < range_size < 0.08 and abs(oscillator_value) < 0.5 and 30 < current_rsi < 70):
+            recs.append({
                 'type': 'RANGE',
                 'confidence': min(85, max(50, 70 + (range_size * 500))),
                 'entry_range': f"{current_price:.4f}",
-                'upper_range': f"{resistance:.4f}",
-                'lower_range': f"{support:.4f}",
+                'upper_range': f"{(resistance if not pd.isna(resistance) else current_price*1.02):.4f}",
+                'lower_range': f"{(support if not pd.isna(support) else current_price*0.98):.4f}",
                 'stop_loss': f"{current_price * 0.95:.4f}",
                 'expected_profit': f"{(range_size * 50):.2f}%"
             })
 
-        # Return best recommendation
-        if recommendations:
-            return max(recommendations, key=lambda x: x['confidence'])
-
+        if recs:
+            return max(recs, key=lambda x: x['confidence'])
         return {
             'type': 'HOLD',
             'confidence': 30,
@@ -320,7 +290,6 @@ class TradingBotAnalyzer:
         }
 
 def init_session_state():
-    """Initialize session state variables"""
     if 'dark_mode' not in st.session_state:
         st.session_state.dark_mode = False
     if 'last_update' not in st.session_state:
@@ -329,18 +298,11 @@ def init_session_state():
         st.session_state.scanner_data = []
 
 def apply_theme():
-    """Apply dark/light theme"""
     if st.session_state.dark_mode:
         st.markdown("""
         <style>
-        .stApp {
-            background-color: #0e1117;
-            color: #fafafa;
-        }
-        .metric-card {
-            background-color: #262730;
-            border-color: #464853;
-        }
+        .stApp { background-color: #0e1117; color: #fafafa; }
+        .metric-card { background-color: #262730; border-color: #464853; }
         </style>
         """, unsafe_allow_html=True)
 
@@ -349,35 +311,26 @@ def main():
     load_css()
     apply_theme()
 
-    # Header with dark mode toggle
     col1, col2, col3 = st.columns([1, 2, 1])
     with col1:
         if st.button("🌙" if not st.session_state.dark_mode else "☀️"):
             st.session_state.dark_mode = not st.session_state.dark_mode
             st.rerun()
-
     with col2:
         st.markdown('<h1 class="main-header">📈 Binance Futures Scanner</h1>', unsafe_allow_html=True)
-
     with col3:
         auto_refresh = st.checkbox("Auto Refresh (1min)", value=True)
 
-    # Initialize scanner
     scanner = BinanceScanner()
     analyzer = TradingBotAnalyzer()
 
-    # Sidebar controls
     with st.sidebar:
         st.header("⚙️ Settings")
-
         refresh_interval = st.selectbox(
-            "Refresh Interval",
-            [60, 120, 300],
+            "Refresh Interval", [60, 120, 300],
             format_func=lambda x: f"{x//60} minute{'s' if x//60 > 1 else ''}"
         )
-
         min_confidence = st.slider("Minimum Confidence %", 0, 100, 60)
-
         show_charts = st.checkbox("Show Charts", value=False)
 
         st.header("📊 Bot Types")
@@ -388,18 +341,15 @@ def main():
         if st.button("🔄 Force Refresh"):
             st.session_state.last_update = datetime.now() - timedelta(minutes=2)
 
-    # Auto refresh logic
     current_time = datetime.now()
     if auto_refresh and (current_time - st.session_state.last_update).seconds >= refresh_interval:
         st.session_state.last_update = current_time
         st.rerun()
 
-    # Main scanning logic
     with st.spinner("🔍 Scanning top 30 Binance futures..."):
         top_symbols = scanner.get_top_futures_symbols(30)
-
         if not top_symbols:
-            st.error("Failed to fetch data from Binance API")
+            st.error("Failed to fetch data from Binance Futures API")
             return
 
         scanner_results = []
@@ -407,24 +357,21 @@ def main():
 
         for i, symbol_data in enumerate(top_symbols):
             symbol = symbol_data['symbol']
-            current_price = float(symbol_data['lastPrice'])
-            volume_24h = float(symbol_data['quoteVolume'])
-            price_change = float(symbol_data['priceChangePercent'])
+            try:
+                current_price = float(symbol_data.get('lastPrice') or 0)
+            except:
+                current_price = 0.0
+            price_change = float(symbol_data.get('priceChangePercent') or 0.0)
+            volume_24h = float(symbol_data.get('quoteVolume') or 0.0)
 
-            # Get kline data for different timeframes
-            df_1h = scanner.get_klines(symbol, '1h', 100)
-            df_15m = scanner.get_klines(symbol, '15m', 100)
-            df_5m = scanner.get_klines(symbol, '5m', 100)
-            df_1m = scanner.get_klines(symbol, '1m', 100)
+            df_1h = scanner.get_klines(symbol, '1h', 300)
+            df_15m = scanner.get_klines(symbol, '15m', 300)
+            df_5m = scanner.get_klines(symbol, '5m', 300)
+            df_1m = scanner.get_klines(symbol, '1m', 300)
 
             if not df_1h.empty:
-                # Analyze trends
                 trend_predictions = analyzer.analyze_trend_direction(df_1h, df_15m, df_5m, df_1m)
-
-                # Get bot recommendation
                 bot_recommendation = analyzer.recommend_bot_strategy(df_1h, symbol, current_price)
-
-                # Calculate support/resistance
                 support, resistance = TechnicalAnalyzer.calculate_support_resistance(df_1h)
 
                 scanner_results.append({
@@ -450,33 +397,22 @@ def main():
 
             progress_bar.progress((i + 1) / len(top_symbols))
 
-        # Sort by confidence
         scanner_results.sort(key=lambda x: x['confidence'], reverse=True)
         st.session_state.scanner_data = scanner_results
 
-    # Display results
     st.header("🎯 Top Trading Opportunities")
 
-    # Summary metrics
     col1, col2, col3, col4 = st.columns(4)
-
     with col1:
-        total_opportunities = len([r for r in scanner_results if r['confidence'] >= min_confidence])
-        st.metric("Total Opportunities", total_opportunities)
-
+        total_opps = len([r for r in scanner_results if r['confidence'] >= min_confidence])
+        st.metric("Total Opportunities", total_opps)
     with col2:
-        long_bots = len([r for r in scanner_results if r['bot_type'] == 'LONG' and r['confidence'] >= min_confidence])
-        st.metric("Long Bots", long_bots)
-
+        st.metric("Long Bots", len([r for r in scanner_results if r['bot_type'] == 'LONG' and r['confidence'] >= min_confidence]))
     with col3:
-        short_bots = len([r for r in scanner_results if r['bot_type'] == 'SHORT' and r['confidence'] >= min_confidence])
-        st.metric("Short Bots", short_bots)
-
+        st.metric("Short Bots", len([r for r in scanner_results if r['bot_type'] == 'SHORT' and r['confidence'] >= min_confidence]))
     with col4:
-        range_bots = len([r for r in scanner_results if r['bot_type'] == 'RANGE' and r['confidence'] >= min_confidence])
-        st.metric("Range Bots", range_bots)
+        st.metric("Range Bots", len([r for r in scanner_results if r['bot_type'] == 'RANGE' and r['confidence'] >= min_confidence]))
 
-    # Filter results
     filtered_results = []
     for result in scanner_results:
         if result['confidence'] < min_confidence:
@@ -489,101 +425,73 @@ def main():
             continue
         filtered_results.append(result)
 
-    # Display trading opportunities
-    for i, result in enumerate(filtered_results[:15]):  # Show top 15
+    for i, result in enumerate(filtered_results[:15]):
         with st.container():
-            # Bot type styling
             bot_class = f"{result['bot_type'].lower()}-bot"
-
             st.markdown(f"""
             <div class="bot-recommendation {bot_class}">
                 <h3>#{i+1} {result['symbol']} - {result['bot_type']} Bot</h3>
             </div>
             """, unsafe_allow_html=True)
 
-            col1, col2, col3, col4 = st.columns(4)
-
-            with col1:
-                st.metric(
-                    "Current Price", 
-                    f"${result['current_price']:.4f}",
-                    f"{result['price_change_24h']:.2f}%"
-                )
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("Current Price", f"${result['current_price']:.4f}", f"{result['price_change_24h']:.2f}%")
                 st.metric("Confidence", f"{result['confidence']:.0f}%")
-
-            with col2:
+            with c2:
                 st.write("**Price Ranges:**")
                 st.write(f"Entry: {result['entry_range']}")
                 st.write(f"Upper: {result['upper_range']}")
                 st.write(f"Lower: {result['lower_range']}")
                 st.write(f"Stop Loss: {result['stop_loss']}")
-
-            with col3:
+            with c3:
                 st.write("**Support/Resistance:**")
-                st.write(f"Support: {result['support']:.4f}")
-                st.write(f"Resistance: {result['resistance']:.4f}")
-                profit_class = "profit-positive" if "%" in result['expected_profit'] and float(result['expected_profit'].replace('%', '')) > 0 else "profit-negative"
+                spt = result['support']
+                rst = result['resistance']
+                st.write(f"Support: {spt:.4f}" if pd.notna(spt) else "Support: N/A")
+                st.write(f"Resistance: {rst:.4f}" if pd.notna(rst) else "Resistance: N/A")
+                try:
+                    p = float(str(result['expected_profit']).replace('%',''))
+                    profit_class = "profit-positive" if p > 0 else "profit-negative"
+                except:
+                    profit_class = "profit-positive"
                 st.markdown(f"<span class='{profit_class}'>Expected Profit: {result['expected_profit']}</span>", unsafe_allow_html=True)
-
-            with col4:
+            with c4:
                 st.write("**Trend Analysis:**")
                 st.write(f"1h: {result['trend_1h']}")
                 st.write(f"15m: {result['trend_15m']}")
                 st.write(f"5m: {result['trend_5m']}")
                 st.write(f"1m: {result['trend_1m']}")
 
-            # Optional chart display
-            if show_charts and not result['df_1h'].empty:
-                with st.expander(f"📊 {result['symbol']} Chart"):
-                    df = result['df_1h'].tail(50)
+            if st.checkbox(f"Show {result['symbol']} chart", key=f"chart_{i}") and not result['df_1h'].empty:
+                df = result['df_1h'].tail(80)
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
+                                    subplot_titles=[f"{result['symbol']} Price", "Two-Pole Oscillator"],
+                                    row_width=[0.7, 0.3])
 
-                    fig = make_subplots(
-                        rows=2, cols=1,
-                        shared_xaxes=True,
-                        vertical_spacing=0.1,
-                        subplot_titles=[f'{result["symbol"]} Price', 'Two-Pole Oscillator'],
-                        row_width=[0.7, 0.3]
-                    )
-
-                    # Candlestick chart
-                    fig.add_trace(
-                        go.Candlestick(
-                            x=df['timestamp'],
-                            open=df['open'],
-                            high=df['high'],
-                            low=df['low'],
-                            close=df['close'],
-                            name='Price'
-                        ),
-                        row=1, col=1
-                    )
-
-                    # Support/Resistance lines
+                fig.add_trace(
+                    go.Candlestick(
+                        x=df['timestamp'], open=df['open'], high=df['high'],
+                        low=df['low'], close=df['close'], name='Price'
+                    ), row=1, col=1
+                )
+                if pd.notna(result['support']):
                     fig.add_hline(y=result['support'], line_dash="dash", line_color="green", row=1, col=1)
+                if pd.notna(result['resistance']):
                     fig.add_hline(y=result['resistance'], line_dash="dash", line_color="red", row=1, col=1)
 
-                    # Two-pole oscillator
-                    two_pole_data = TechnicalAnalyzer.two_pole_oscillator(df)
-                    fig.add_trace(
-                        go.Scatter(
-                            x=df['timestamp'],
-                            y=two_pole_data['oscillator'],
-                            mode='lines',
-                            name='Two-Pole Oscillator',
-                            line=dict(color='blue')
-                        ),
-                        row=2, col=1
-                    )
-
-                    fig.update_layout(height=600, showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
+                tp = TechnicalAnalyzer.two_pole_oscillator(df)
+                fig.add_trace(
+                    go.Scatter(x=df['timestamp'], y=tp['oscillator'], mode='lines', name='Two-Pole', line=dict(color='blue')),
+                    row=2, col=1
+                )
+                fig.update_layout(height=600, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
 
             st.divider()
 
-    # Last update info
     st.info(f"Last updated: {st.session_state.last_update.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Auto refresh
     if auto_refresh:
         time.sleep(1)
         st.rerun()
