@@ -1,23 +1,51 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
+import ccxt
 import time
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
-warnings.filterwarnings('ignore')
 
-# Page config
+warnings.filterwarnings("ignore")
+
+# ------------------------------------------------
+# Page setup
+# ------------------------------------------------
 st.set_page_config(
-    page_title="Crypto Futures Scanner",
+    page_title="Binance Futures Scanner",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ---------- Indicator helpers ----------
+st.title("📊 Binance Futures Scanner (with API Key)")
+
+# ------------------------------------------------
+# Load Binance API key/secret from Streamlit Secrets
+# ------------------------------------------------
+try:
+    api_key = st.secrets["BINANCE_API_KEY"]
+    api_secret = st.secrets["BINANCE_API_SECRET"]
+except Exception:
+    st.error("⚠️ Please add your Binance API Key/Secret in Streamlit secrets.")
+    st.stop()
+
+# ------------------------------------------------
+# Setup Binance (ccxt client)
+# ------------------------------------------------
+exchange = ccxt.binance({
+    'apiKey': api_key,
+    'secret': api_secret,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'}  # use Futures API
+})
+
+
+# ------------------------------------------------
+# Indicators
+# ------------------------------------------------
 def sma(series: pd.Series, period: int):
     return series.rolling(window=period, min_periods=period).mean()
 
@@ -51,121 +79,99 @@ def bbands(series: pd.Series, period=20, std_dev=2):
     lower = mid - std_dev * rolling_std
     return upper, mid, lower
 
-# ---------- Data Source (CoinGecko instead of Binance) ----------
-class CoinGeckoScanner:
-    def __init__(self):
-        self.base_url = "https://api.coingecko.com/api/v3"
+# Two-pole oscillator
+def two_pole_oscillator(df, length=20):
+    if df.empty or len(df) < 30:
+        return np.zeros(len(df)), np.zeros(len(df)), [], [], 0.0
 
-    def get_top_symbols(self, limit=30):
-        url = f"{self.base_url}/coins/markets"
-        params = {"vs_currency": "usd", "order": "volume_desc", "per_page": limit, "page": 1, "sparkline": False}
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-            results = []
-            for item in data:
-                results.append({
-                    "symbol": item["symbol"].upper() + "USDT",
-                    "id": item["id"],
-                    "lastPrice": item["current_price"],
-                    "volume_24h": item["total_volume"],
-                    "price_change_24h": item["price_change_percentage_24h"] or 0
-                })
-            return results
-        except Exception as e:
-            st.error(f"Error fetching symbols from CoinGecko: {e}")
-            return []
+    close = df["close"]
+    sma1 = sma(close, 25)
+    close_sma_diff = close - sma1
+    sma_diff = sma(close_sma_diff, 25)
+    std_diff = close_sma_diff.rolling(25, min_periods=25).std()
+    sma_n1 = (close_sma_diff - sma_diff) / std_diff.replace(0, np.nan)
+    sma_n1 = sma_n1.fillna(0.0).values
 
-    def get_ohlc(self, coin_id, days=1):
-        url = f"{self.base_url}/coins/{coin_id}/ohlc"
-        params = {"vs_currency": "usd", "days": days}  # days=1 → 1d OHLC
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list):
-                return pd.DataFrame()
-            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-            return df
-        except Exception as e:
-            st.error(f"Error fetching OHLC for {coin_id}: {e}")
-            return pd.DataFrame()
+    alpha = 2.0 / (length + 1)
+    smooth1, smooth2 = np.zeros_like(sma_n1), np.zeros_like(sma_n1)
+    for i in range(len(sma_n1)):
+        if i == 0:
+            smooth1[i] = sma_n1[i]
+            smooth2[i] = smooth1[i]
+        else:
+            smooth1[i] = (1 - alpha) * smooth1[i-1] + alpha * sma_n1[i]
+            smooth2[i] = (1 - alpha) * smooth2[i-1] + alpha * smooth1[i]
 
-# ---------- Technical Analyzer ----------
-class TechnicalAnalyzer:
-    @staticmethod
-    def two_pole_oscillator(df, length=20):
-        if df.empty or len(df) < 30:
-            n = len(df)
-            arr = np.zeros(n)
-            return {"oscillator": arr, "oscillator_prev": np.roll(arr, 4), "buy_signals": [], "sell_signals": [], "current_value": 0.0}
+    two_p = smooth2
+    two_pp = np.roll(two_p, 4)
 
-        close = df["close"]
-        sma1 = sma(close, 25)
-        close_sma_diff = close - sma1
-        sma_diff = sma(close_sma_diff, 25)
-        std_diff = close_sma_diff.rolling(25, min_periods=25).std()
-        sma_n1 = (close_sma_diff - sma_diff) / std_diff.replace(0, np.nan)
-        sma_n1 = sma_n1.fillna(0.0).values
+    buy_signals, sell_signals = [], []
+    for i in range(1, len(two_p)):
+        if two_p[i] > two_pp[i] and two_p[i-1] <= two_pp[i-1] and two_p[i] < 0:
+            buy_signals.append(i)
+        elif two_p[i] < two_pp[i] and two_p[i-1] >= two_pp[i-1] and two_p[i] > 0:
+            sell_signals.append(i)
 
-        alpha = 2.0 / (length + 1)
-        smooth1 = np.zeros_like(sma_n1)
-        smooth2 = np.zeros_like(sma_n1)
-        for i in range(len(sma_n1)):
-            if i == 0:
-                smooth1[i] = sma_n1[i]
-                smooth2[i] = smooth1[i]
-            else:
-                smooth1[i] = (1 - alpha) * smooth1[i-1] + alpha * sma_n1[i]
-                smooth2[i] = (1 - alpha) * smooth2[i-1] + alpha * smooth1[i]
-        two_p = smooth2
-        two_pp = np.roll(two_p, 4)
+    return two_p, two_pp, buy_signals, sell_signals, float(two_p[-1])
 
-        buy_signals = [i for i in range(1, len(two_p)) if two_p[i] > two_pp[i] and two_p[i-1] <= two_pp[i-1] and two_p[i] < 0]
-        sell_signals = [i for i in range(1, len(two_p)) if two_p[i] < two_pp[i] and two_p[i-1] >= two_pp[i-1] and two_p[i] > 0]
 
-        return {"oscillator": two_p, "oscillator_prev": two_pp, "buy_signals": buy_signals, "sell_signals": sell_signals, "current_value": float(two_p[-1])}
+# ------------------------------------------------
+# Fetch Futures Market Data
+# ------------------------------------------------
+def get_top_futures_symbols(limit=10):
+    tickers = exchange.fapiPublic_get_ticker_24hr()
+    usdt_pairs = [t for t in tickers if t['symbol'].endswith("USDT")]
+    sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)
+    return sorted_pairs[:limit]
 
-# ---------- Main App ----------
-def main():
-    st.title("📊 Crypto Futures Scanner (CoinGecko data)")
-    scanner = CoinGeckoScanner()
-
-    with st.sidebar:
-        refresh_interval = st.selectbox("Refresh Interval", [60, 120, 300], format_func=lambda x: f"{x//60} min")
-        st.write("Bot Types: (analysis logic unchanged)")
-        show_long = st.checkbox("Long Bots", True)
-        show_short = st.checkbox("Short Bots", True)
-        show_range = st.checkbox("Range Bots", True)
-        if st.button("Force Refresh"):
-            st.rerun()
-
-    st.info("Fetching top markets from CoinGecko...")
-
-    top_symbols = scanner.get_top_symbols(10)  # fetch top 10 for quicker testing
-    if not top_symbols:
-        st.error("No symbols fetched!")
-        return
-
-    results = []
-    for sym in top_symbols:
-        df = scanner.get_ohlc(sym["id"], days=1)
-        if df.empty:
-            continue
-        df = df.tail(200)  # keep last few candles
-        tp = TechnicalAnalyzer.two_pole_oscillator(df)
-
-        results.append({
-            "symbol": sym["symbol"],
-            "price": sym["lastPrice"],
-            "24h change": sym["price_change_24h"],
-            "oscillator": tp["current_value"]
+def get_klines(symbol, timeframe="1h", limit=200):
+    try:
+        ohlcv = exchange.fapiPublic_get_klines({
+            "symbol": symbol,
+            "interval": timeframe,
+            "limit": limit
         })
+        df = pd.DataFrame(ohlcv, columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+            'taker_buy_quote', 'ignore'
+        ])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return df
+    except Exception as e:
+        st.error(f"Error fetching klines: {e}")
+        return pd.DataFrame()
 
-    df_results = pd.DataFrame(results)
-    st.dataframe(df_results)
 
-if __name__ == "__main__":
-    main()
+# ------------------------------------------------
+# Main App Logic
+# ------------------------------------------------
+refresh = st.sidebar.selectbox("Refresh Interval", [60, 120, 300], format_func=lambda x: f"{x//60} min")
+
+st.info("Fetching Binance Futures data with your API key...")
+
+symbols = get_top_futures_symbols(10)
+results = []
+for s in symbols:
+    sym = s["symbol"]
+    last_price = float(s["lastPrice"])
+    df = get_klines(sym, "15m", 200)
+    if df.empty:
+        continue
+
+    rsi_vals = rsi(df["close"])
+    macd_line, signal_line, _ = macd(df["close"])
+    upper, mid, lower = bbands(df["close"])
+    two_p, two_pp, buys, sells, osc_val = two_pole_oscillator(df)
+
+    results.append({
+        "symbol": sym,
+        "last_price": last_price,
+        "RSI": float(rsi_vals.iloc[-1]),
+        "MACD": float(macd_line.iloc[-1] - signal_line.iloc[-1]),
+        "Oscillator": osc_val
+    })
+
+st.dataframe(pd.DataFrame(results))
