@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import ccxt
+import requests
 import warnings
+from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
@@ -16,28 +17,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("📊 Binance Futures Scanner (with API Key)")
+st.title("📊 Binance Futures Scanner (Futures Data)")
 
-# ------------------------------------------------
-# Load Binance API key/secret from Streamlit Secrets
-# ------------------------------------------------
-try:
-    api_key = st.secrets["BINANCE_API_KEY"]
-    api_secret = st.secrets["BINANCE_API_SECRET"]
-except Exception:
-    st.error("⚠️ Please add your Binance API Key/Secret in Streamlit secrets.")
-    st.stop()
-
-# ------------------------------------------------
-# Setup Binance Futures via ccxt RAW API
-# ------------------------------------------------
-exchange = ccxt.binance({
-    "apiKey": api_key,
-    "secret": api_secret,
-    "enableRateLimit": True,
-    "options": {"defaultType": "future"}  # force Futures only
-})
-
+BASE_URL = "https://fapi.binance.com"  # Binance Futures API base
 
 # ------------------------------------------------
 # Indicators
@@ -69,26 +51,27 @@ def macd(series, fast=12, slow=26, signal=9):
 
 
 # ------------------------------------------------
-# Fetch Futures Market Data
+# Fetch Binance Futures Market Data via REST
 # ------------------------------------------------
 def get_top_futures_symbols(limit=10):
-    """Fetch top futures pairs by volume."""
-    tickers = exchange.fapiPublic_get_ticker_24hr()
-    usdt_pairs = [t for t in tickers if t["symbol"].endswith("USDT")]
-    sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+    url = f"{BASE_URL}/fapi/v1/ticker/24hr"
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    usdt_pairs = [t for t in data if t["symbol"].endswith("USDT")]
+    sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x["quoteVolume"]), reverse=True)
     return sorted_pairs[:limit]
 
 def get_klines(symbol, interval="15m", limit=200):
-    """Raw Binance futures kline fetch."""
-    ohlcv = exchange.fapiPublic_get_klines({
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    })
-    df = pd.DataFrame(ohlcv, columns=[
+    url = f"{BASE_URL}/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    df = pd.DataFrame(data, columns=[
         "timestamp","open","high","low","close","volume",
-        "close_time","quote_asset_volume","trades",
-        "taker_base","taker_quote","ignore"
+        "close_time","qav","trades","taker_base","taker_quote","ignore"
     ])
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -99,7 +82,7 @@ def get_klines(symbol, interval="15m", limit=200):
 # ------------------------------------------------
 # Main App Logic
 # ------------------------------------------------
-st.info("Fetching Binance Futures data with your API key…")
+st.info("Fetching Binance Futures top markets…")
 
 symbols = get_top_futures_symbols(10)
 
